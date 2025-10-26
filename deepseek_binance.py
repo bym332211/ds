@@ -1,0 +1,700 @@
+import os
+import time
+import schedule
+from openai import OpenAI
+import ccxt
+import pandas as pd
+from datetime import datetime, timedelta
+import json
+import requests
+import re
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# DeepSeek client
+deepseek_client = OpenAI(
+    api_key=os.getenv('DEEPSEEK_API_KEY'),
+    base_url="https://api.deepseek.com"
+)
+
+# Binance USD-M Futures
+exchange = ccxt.binance({
+    'options': {
+        'defaultType': 'future',
+    },
+    'apiKey': os.getenv('BINANCE_API_KEY'),
+    'secret': os.getenv('BINANCE_SECRET'),
+})
+
+# Trading config
+TRADE_CONFIG = {
+    'symbol': 'BTC/USDT',
+    'amount': 0.01,            # position size in BTC
+    'leverage': 10,
+    'timeframe': '15m',
+    'test_mode': False,
+    'data_points': 96,         # for indicators/trend
+    'analysis_periods': {
+        'short_term': 20,
+        'medium_term': 50,
+        'long_term': 96,
+    }
+}
+
+price_history = []
+signal_history = []
+position = None
+
+
+def setup_exchange():
+    try:
+        # leverage (cross/isolated not forced here to avoid API mismatch)
+        exchange.set_leverage(TRADE_CONFIG['leverage'], TRADE_CONFIG['symbol'])
+        print(f"已设置杠杆: {TRADE_CONFIG['leverage']}x")
+
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['USDT']['free']
+        print(f"可用USDT余额: {usdt_balance:.2f}")
+        return True
+    except Exception as e:
+        print(f"交易所初始化失败: {e}")
+        return False
+
+
+def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        # SMA
+        df['sma_5'] = df['close'].rolling(window=5, min_periods=1).mean()
+        df['sma_20'] = df['close'].rolling(window=20, min_periods=1).mean()
+        df['sma_50'] = df['close'].rolling(window=50, min_periods=1).mean()
+
+        # EMA & MACD
+        df['ema_12'] = df['close'].ewm(span=12).mean()
+        df['ema_26'] = df['close'].ewm(span=26).mean()
+        df['macd'] = df['ema_12'] - df['ema_26']
+        df['macd_signal'] = df['macd'].ewm(span=9).mean()
+        df['macd_histogram'] = df['macd'] - df['macd_signal']
+
+        # RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+
+        # Bollinger Bands
+        df['bb_middle'] = df['close'].rolling(20).mean()
+        bb_std = df['close'].rolling(20).std()
+        df['bb_upper'] = df['bb_middle'] + (bb_std * 2)
+        df['bb_lower'] = df['bb_middle'] - (bb_std * 2)
+        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+
+        # Volume indicators
+        df['volume_ma'] = df['volume'].rolling(20).mean()
+        df['volume_ratio'] = df['volume'] / df['volume_ma']
+
+        # Basic support/resistance (rolling)
+        df['resistance'] = df['high'].rolling(20).max()
+        df['support'] = df['low'].rolling(20).min()
+
+        df = df.bfill().ffill()
+        return df
+    except Exception as e:
+        print(f"技术指标计算异常: {e}")
+        return df
+
+
+def get_support_resistance_levels(df: pd.DataFrame, lookback: int = 20) -> dict:
+    try:
+        recent_high = df['high'].tail(lookback).max()
+        recent_low = df['low'].tail(lookback).min()
+        current_price = df['close'].iloc[-1]
+
+        resistance_level = recent_high
+        support_level = recent_low
+
+        bb_upper = df['bb_upper'].iloc[-1]
+        bb_lower = df['bb_lower'].iloc[-1]
+
+        return {
+            'static_resistance': resistance_level,
+            'static_support': support_level,
+            'dynamic_resistance': bb_upper,
+            'dynamic_support': bb_lower,
+            'price_vs_resistance': ((resistance_level - current_price) / current_price) * 100,
+            'price_vs_support': ((current_price - support_level) / support_level) * 100,
+        }
+    except Exception as e:
+        print(f"支撑阻力计算异常: {e}")
+        return {}
+
+
+def get_market_trend(df: pd.DataFrame) -> dict:
+    try:
+        def slope(series, window):
+            if len(series) < window:
+                return 0
+            seg = series.tail(window)
+            return (seg.iloc[-1] - seg.iloc[0]) / max(abs(seg.iloc[0]), 1e-9)
+
+        short = slope(df['close'], TRADE_CONFIG['analysis_periods']['short_term'])
+        medium = slope(df['close'], TRADE_CONFIG['analysis_periods']['medium_term'])
+        long = slope(df['close'], TRADE_CONFIG['analysis_periods']['long_term'])
+
+        def label(x):
+            return 'bullish' if x > 0 else 'bearish' if x < 0 else 'neutral'
+
+        macd_trend = 'bullish' if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1] else 'bearish'
+        overall = 'bullish' if (short + medium + long) > 0 else 'bearish' if (short + medium + long) < 0 else 'neutral'
+
+        return {
+            'short_term': label(short),
+            'medium_term': label(medium),
+            'long_term': label(long),
+            'overall': overall,
+            'macd': macd_trend,
+        }
+    except Exception as e:
+        print(f"趋势分析异常: {e}")
+        return {}
+
+
+def get_sentiment_indicators() -> dict | None:
+    """Fetch market sentiment (CryptOracle) for BTC over last 4 hours."""
+    try:
+        api_url = os.getenv('CRYPTO_ORACLE_API_URL', 'https://service.cryptoracle.network/openapi/v2/endpoint')
+        api_key = os.getenv('CRYPTO_ORACLE_API_KEY')
+        if not api_key:
+            return None
+
+        end_time = datetime.now()
+        start_time = end_time - timedelta(hours=4)
+
+        request_body = {
+            "apiKey": api_key,
+            "endpoints": ["CO-A-02-01", "CO-A-02-02", "CO-A-01-03"],
+            "startTime": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "endTime": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timeType": "15m",
+            "token": ["BTC"],
+        }
+
+        headers = {"Content-Type": "application/json", "X-API-KEY": api_key}
+        resp = requests.post(api_url, json=request_body, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if data.get('code') != 200 or not data.get('data'):
+            return None
+
+        time_periods = data['data'][0].get('timePeriods', [])
+        for period in time_periods:
+            period_data = period.get('data', [])
+            sentiment = {}
+            community_activity = None
+            valid = False
+
+            for item in period_data:
+                endpoint = item.get('endpoint')
+                value = (item.get('value') or '').strip()
+                if not value:
+                    continue
+                if endpoint in ["CO-A-02-01", "CO-A-02-02"]:
+                    sentiment[endpoint] = float(value)
+                    valid = True
+                elif endpoint == "CO-A-01-03":
+                    community_activity = float(value)
+
+            if valid and "CO-A-02-01" in sentiment and "CO-A-02-02" in sentiment:
+                positive = sentiment['CO-A-02-01']
+                negative = sentiment['CO-A-02-02']
+                net = positive - negative
+                return {
+                    'positive_ratio': positive,
+                    'negative_ratio': negative,
+                    'net_sentiment': net,
+                    'sentiment_strength': abs(net),
+                    'bullish_bias': net > 0.1,
+                    'bearish_bias': net < -0.1,
+                    'community_activity': community_activity,
+                    'data_time': period.get('startTime'),
+                }
+        return None
+    except Exception as e:
+        print(f"情绪指标获取异常: {e}")
+        return None
+
+
+def get_btc_ohlcv_enhanced():
+    try:
+        ohlcv = exchange.fetch_ohlcv(
+            TRADE_CONFIG['symbol'],
+            TRADE_CONFIG['timeframe'],
+            limit=TRADE_CONFIG['data_points']
+        )
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+        df = calculate_technical_indicators(df)
+
+        current = df.iloc[-1]
+        previous = df.iloc[-2]
+
+        trend_analysis = get_market_trend(df)
+        levels_analysis = get_support_resistance_levels(df)
+
+        return {
+            'price': current['close'],
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'high': current['high'],
+            'low': current['low'],
+            'volume': current['volume'],
+            'timeframe': TRADE_CONFIG['timeframe'],
+            'price_change': ((current['close'] - previous['close']) / previous['close']) * 100,
+            'kline_data': df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].tail(10).to_dict('records'),
+            'technical_data': {
+                'sma_5': current.get('sma_5', 0),
+                'sma_20': current.get('sma_20', 0),
+                'sma_50': current.get('sma_50', 0),
+                'rsi': current.get('rsi', 0),
+                'macd': current.get('macd', 0),
+                'macd_signal': current.get('macd_signal', 0),
+                'macd_histogram': current.get('macd_histogram', 0),
+                'bb_upper': current.get('bb_upper', 0),
+                'bb_lower': current.get('bb_lower', 0),
+                'bb_position': current.get('bb_position', 0),
+                'volume_ratio': current.get('volume_ratio', 0),
+            },
+            'trend_analysis': trend_analysis,
+            'levels_analysis': levels_analysis,
+            'full_data': df,
+        }
+    except Exception as e:
+        print(f"获取行情/指标失败: {e}")
+        return None
+
+
+def generate_technical_analysis_text(price_data: dict) -> str:
+    if 'technical_data' not in price_data:
+        return ""
+    tech = price_data['technical_data']
+    trend = price_data.get('trend_analysis', {})
+    levels = price_data.get('levels_analysis', {})
+
+    def safe_float(val, default=0.0):
+        try:
+            return float(val) if val is not None and pd.notna(val) else default
+        except Exception:
+            return default
+
+    text = f"""
+技术面概览:
+- SMA5: {safe_float(tech['sma_5']):.2f}  距离: {(price_data['price'] - safe_float(tech['sma_5']))/max(safe_float(tech['sma_5']),1e-9)*100:+.2f}%
+- SMA20: {safe_float(tech['sma_20']):.2f} 距离: {(price_data['price'] - safe_float(tech['sma_20']))/max(safe_float(tech['sma_20']),1e-9)*100:+.2f}%
+- SMA50: {safe_float(tech['sma_50']):.2f} 距离: {(price_data['price'] - safe_float(tech['sma_50']))/max(safe_float(tech['sma_50']),1e-9)*100:+.2f}%
+
+趋势判断:
+- 短期: {trend.get('short_term','N/A')}  中期: {trend.get('medium_term','N/A')}  总体: {trend.get('overall','N/A')}
+- MACD: {trend.get('macd','N/A')}
+
+动量/震荡:
+- RSI: {safe_float(tech['rsi']):.2f}
+- MACD值: {safe_float(tech['macd']):.4f} 信号: {safe_float(tech['macd_signal']):.4f}
+
+布林位置: {safe_float(tech['bb_position']):.2%}
+
+支撑阻力:
+- 静态阻力: {safe_float(levels.get('static_resistance',0)):.2f}
+- 静态支撑: {safe_float(levels.get('static_support',0)):.2f}
+"""
+    return text
+
+
+def get_current_position():
+    """Fetch current position for Binance futures (one-way or hedge tolerant)."""
+    try:
+        positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
+
+        # Accept both forms like 'BTC/USDT' and 'BTC/USDT:USDT'
+        acceptable = {TRADE_CONFIG['symbol'], f"{TRADE_CONFIG['symbol']}:USDT"}
+
+        for pos in positions:
+            if pos.get('symbol') not in acceptable:
+                continue
+
+            position_amt = 0.0
+            info = pos.get('info', {})
+            if 'positionAmt' in info and info.get('positionAmt') is not None:
+                try:
+                    position_amt = float(info['positionAmt'])
+                except Exception:
+                    position_amt = 0.0
+            elif 'contracts' in pos and pos.get('contracts') is not None:
+                contracts = float(pos['contracts'])
+                if pos.get('side') == 'short':
+                    position_amt = -contracts
+                else:
+                    position_amt = contracts
+
+            if position_amt != 0:
+                side = 'long' if position_amt > 0 else 'short'
+                return {
+                    'side': side,
+                    'size': abs(position_amt),
+                    'entry_price': float(pos.get('entryPrice', 0) or info.get('entryPrice') or 0),
+                    'unrealized_pnl': float(pos.get('unrealizedPnl', 0) or info.get('unRealizedProfit') or 0),
+                    'position_amt': position_amt,
+                    'symbol': pos.get('symbol'),
+                }
+
+        return None
+    except Exception as e:
+        print(f"获取持仓失败: {e}")
+        return None
+
+
+def safe_json_parse(json_str: str):
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        try:
+            s = json_str.replace("'", '"')
+            s = re.sub(r'(\w+):', r'"\\1":', s)
+            s = re.sub(r',\s*}', '}', s)
+            s = re.sub(r',\s*]', ']', s)
+            return json.loads(s)
+        except Exception as e:
+            print(f"JSON解析失败，原始: {json_str}")
+            print(f"错误: {e}")
+            return None
+
+
+def create_fallback_signal(price_data: dict) -> dict:
+    return {
+        'signal': 'HOLD',
+        'reason': 'LLM/解析失败或数据不足，采用回退策略',
+        'stop_loss': price_data['price'] * 0.98,
+        'take_profit': price_data['price'] * 1.02,
+        'confidence': 'LOW',
+        'is_fallback': True,
+    }
+
+
+def analyze_with_deepseek(price_data: dict) -> dict:
+    technical_analysis = generate_technical_analysis_text(price_data)
+
+    # recent K lines text (last 5)
+    kline_text = f"最近5根{TRADE_CONFIG['timeframe']}K线:\n"
+    for i, kline in enumerate(price_data['kline_data'][-5:]):
+        trend = "阳" if kline['close'] > kline['open'] else "阴"
+        change = ((kline['close'] - kline['open']) / max(kline['open'], 1e-9)) * 100
+        kline_text += f"K{i+1}: {trend} 开:{kline['open']:.2f} 收:{kline['close']:.2f} 变动:{change:+.2f}%\n"
+
+    # market sentiment
+    sentiment_data = get_sentiment_indicators()
+    if sentiment_data:
+        sign = '+' if sentiment_data['net_sentiment'] >= 0 else ''
+        sentiment_text = (
+            f"市场情绪 正:{sentiment_data['positive_ratio']:.1%} 负:{sentiment_data['negative_ratio']:.1%} 净:{sign}{sentiment_data['net_sentiment']:.3f}"
+        )
+        if sentiment_data.get('bullish_bias'):
+            sentiment_text += " 偏多"
+        elif sentiment_data.get('bearish_bias'):
+            sentiment_text += " 偏空"
+    else:
+        sentiment_text = "市场情绪数据不可用"
+
+    # previous signal snippet
+    signal_text = ""
+    if signal_history:
+        last_signal = signal_history[-1]
+        signal_text = f"\n上次信号\n方向: {last_signal.get('signal','N/A')}\n置信度: {last_signal.get('confidence','N/A')}\n"
+
+    prompt = f"""
+你是加密量化交易助理。请基于以下信息给出BTC/USDT合约的下一个动作：
+
+价格: {price_data['price']:.2f}  涨跌幅(近1根): {price_data['price_change']:+.2f}%
+时间框架: {TRADE_CONFIG['timeframe']}
+
+{kline_text}
+
+{technical_analysis}
+
+{sentiment_text}
+{signal_text}
+
+硬性要求：
+1) 结合“静态阻力/支撑”和当前价，给出合理的止损与止盈。
+2) 计算盈亏比 RRR = |take_profit - entry| / |entry - stop_loss|，若 RRR < 3 则必须给出 HOLD。
+3) 如建议开仓（BUY/SELL），所给止盈/止损需满足 RRR ≥ 3。
+
+仅输出JSON，包含如下字段：
+{{
+  "signal": "BUY|SELL|HOLD",
+  "reason": "文字说明，包含阻力/支撑与RRR的简述",
+  "stop_loss": 数值价格,
+  "take_profit": 数值价格,
+  "confidence": "HIGH|MEDIUM|LOW"
+}}
+"""
+
+    try:
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": f"你是稳健的加密量化交易分析师，基于{TRADE_CONFIG['timeframe']}级别数据与技术/情绪面给出严格JSON决策。"},
+                {"role": "user", "content": prompt},
+            ],
+            stream=False,
+            temperature=0.1,
+        )
+
+        result = response.choices[0].message.content
+        print(f"DeepSeek原始: {result}")
+
+        start = result.find('{')
+        end = result.rfind('}') + 1
+        if start != -1 and end > start:
+            json_str = result[start:end]
+            signal_data = safe_json_parse(json_str)
+            if signal_data is None:
+                signal_data = create_fallback_signal(price_data)
+        else:
+            signal_data = create_fallback_signal(price_data)
+
+        required = ['signal', 'reason', 'stop_loss', 'take_profit', 'confidence']
+        if not all(k in signal_data for k in required):
+            signal_data = create_fallback_signal(price_data)
+
+        signal_data['timestamp'] = price_data['timestamp']
+        signal_history.append(signal_data)
+        if len(signal_history) > 30:
+            signal_history.pop(0)
+
+        # tiny consistency note
+        same_count = len([s for s in signal_history if s.get('signal') == signal_data['signal']])
+        print(f"信号: {signal_data['signal']} (历史相同方向 {same_count}/{len(signal_history)})")
+        return signal_data
+    except Exception as e:
+        print(f"DeepSeek分析失败: {e}")
+        return create_fallback_signal(price_data)
+
+
+def execute_trade(signal_data: dict, price_data: dict):
+    global position
+    current_position = get_current_position()
+
+    # Change-direction guard: require HIGH confidence and avoid quick flip-flop
+    if current_position and signal_data['signal'] != 'HOLD':
+        current_side = current_position['side']
+        new_side = 'long' if signal_data['signal'] == 'BUY' else 'short' if signal_data['signal'] == 'SELL' else None
+        if new_side and new_side != current_side:
+            if signal_data['confidence'] != 'HIGH':
+                print(f"非高置信度换向，忽略（当前: {current_side} -> 新: {new_side}）")
+                return
+            if len(signal_history) >= 2:
+                last_signals = [s['signal'] for s in signal_history[-2:]]
+                if signal_data['signal'] in last_signals:
+                    print("近期已有同向换向尝试，避免频繁反手")
+                    return
+
+    print(f"执行信号: {signal_data['signal']}")
+    print(f"置信度: {signal_data['confidence']}")
+    print(f"理由: {signal_data['reason']}")
+    print(f"止损: ${signal_data['stop_loss']:,.2f}")
+    print(f"止盈: ${signal_data['take_profit']:,.2f}")
+    print(f"当前持仓: {current_position}")
+
+    # 计算并校验盈亏比（以当前价视作进场价）
+    entry = float(price_data['price'])
+    sl = float(signal_data['stop_loss'])
+    tp = float(signal_data['take_profit'])
+    risk = abs(entry - sl)
+    reward = abs(tp - entry)
+    rrr = (reward / risk) if risk > 0 else 0
+    print(f"计算RRR: {rrr:.2f} (risk={risk:.2f}, reward={reward:.2f})")
+
+    # 若建议开仓但RRR < 3，则强制不交易
+    if signal_data['signal'] in ('BUY', 'SELL') and rrr < 3:
+        print("RRR低于3:1，放弃开仓")
+        return
+
+    # Low-confidence skip in live
+    if signal_data['confidence'] == 'LOW' and not TRADE_CONFIG['test_mode']:
+        print("低置信度信号，跳过实盘下单")
+        return
+
+    if TRADE_CONFIG['test_mode']:
+        print("测试模式 - 不实际下单")
+        return
+
+    try:
+        # margin sanity check
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['USDT']['free']
+        required_margin = price_data['price'] * TRADE_CONFIG['amount'] / max(TRADE_CONFIG['leverage'], 1)
+        if required_margin > usdt_balance * 0.8:
+            print(f"保证金不足，需: {required_margin:.2f}USDT，可用: {usdt_balance:.2f}USDT")
+            return
+
+        symbol = TRADE_CONFIG['symbol']
+
+        if signal_data['signal'] == 'BUY':
+            if current_position and current_position['side'] == 'short':
+                print("平空...")
+                exchange.create_order(symbol, 'market', 'buy', current_position['size'], None, {'reduceOnly': True})
+                time.sleep(1)
+                print("开多...")
+                exchange.create_order(symbol, 'market', 'buy', TRADE_CONFIG['amount'])
+                # 查询新持仓并挂保护单
+                time.sleep(1)
+                new_pos = get_current_position()
+                if new_pos:
+                    place_bracket_orders('long', new_pos['size'], sl, tp)
+            elif current_position and current_position['side'] == 'long':
+                print("已在多头，跳过重复加仓")
+            else:
+                print("开多...")
+                exchange.create_order(symbol, 'market', 'buy', TRADE_CONFIG['amount'])
+                time.sleep(1)
+                new_pos = get_current_position()
+                if new_pos:
+                    place_bracket_orders('long', new_pos['size'], sl, tp)
+
+        elif signal_data['signal'] == 'SELL':
+            if current_position and current_position['side'] == 'long':
+                print("平多...")
+                exchange.create_order(symbol, 'market', 'sell', current_position['size'], None, {'reduceOnly': True})
+                time.sleep(1)
+                print("开空...")
+                exchange.create_order(symbol, 'market', 'sell', TRADE_CONFIG['amount'])
+                time.sleep(1)
+                new_pos = get_current_position()
+                if new_pos:
+                    place_bracket_orders('short', new_pos['size'], sl, tp)
+            elif current_position and current_position['side'] == 'short':
+                print("已在空头，跳过重复加仓")
+            else:
+                print("开空...")
+                exchange.create_order(symbol, 'market', 'sell', TRADE_CONFIG['amount'])
+                time.sleep(1)
+                new_pos = get_current_position()
+                if new_pos:
+                    place_bracket_orders('short', new_pos['size'], sl, tp)
+        else:
+            print("持有不动，等待下一次执行")
+            return
+
+        print("下单完成，查询最新持仓...")
+        time.sleep(2)
+        position = get_current_position()
+        print(f"最新持仓: {position}")
+    except Exception as e:
+        print(f"下单执行失败: {e}")
+
+
+def place_bracket_orders(direction: str, size: float, stop_loss: float, take_profit: float):
+    """Place protective stop-loss and take-profit market orders on Binance futures.
+    direction: 'long' or 'short' (current position direction)
+    size: contracts size (BTC amount)
+    """
+    try:
+        symbol = TRADE_CONFIG['symbol']
+        if direction == 'long':
+            # Stop-loss (sell)
+            exchange.create_order(symbol, 'STOP_MARKET', 'sell', size, None, {
+                'stopPrice': float(stop_loss),
+                'reduceOnly': True,
+            })
+            # Take-profit (sell)
+            exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', 'sell', size, None, {
+                'stopPrice': float(take_profit),
+                'reduceOnly': True,
+            })
+        elif direction == 'short':
+            # Stop-loss (buy)
+            exchange.create_order(symbol, 'STOP_MARKET', 'buy', size, None, {
+                'stopPrice': float(stop_loss),
+                'reduceOnly': True,
+            })
+            # Take-profit (buy)
+            exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', 'buy', size, None, {
+                'stopPrice': float(take_profit),
+                'reduceOnly': True,
+            })
+        print("已挂出止损/止盈保护单")
+    except Exception as e:
+        print(f"挂止损/止盈失败: {e}")
+
+
+def analyze_with_deepseek_with_retry(price_data: dict, max_retries: int = 2) -> dict:
+    for attempt in range(max_retries):
+        try:
+            signal_data = analyze_with_deepseek(price_data)
+            if signal_data and not signal_data.get('is_fallback', False):
+                return signal_data
+            print(f"第{attempt+1}次分析失败，重试...")
+            time.sleep(1)
+        except Exception as e:
+            print(f"分析异常(第{attempt+1}次): {e}")
+            if attempt == max_retries - 1:
+                return create_fallback_signal(price_data)
+            time.sleep(1)
+    return create_fallback_signal(price_data)
+
+
+def trading_bot():
+    print("\n" + "=" * 60)
+    print(f"执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+
+    price_data = get_btc_ohlcv_enhanced()
+    if not price_data:
+        return
+
+    print(f"BTC现价: ${price_data['price']:,.2f}")
+    print(f"周期: {TRADE_CONFIG['timeframe']}")
+    print(f"近一根涨跌: {price_data['price_change']:+.2f}%")
+
+    signal_data = analyze_with_deepseek_with_retry(price_data)
+    if signal_data.get('is_fallback', False):
+        print("使用回退信号")
+
+    execute_trade(signal_data, price_data)
+
+
+def main():
+    print("BTC/USDT Binance 合约 DeepSeek 情绪+指标 交易机器人")
+    if TRADE_CONFIG['test_mode']:
+        print("测试模式：只分析不下单")
+    else:
+        print("实盘模式：将根据信号执行下单")
+
+    print(f"时间框架: {TRADE_CONFIG['timeframe']}")
+    print("将周期性拉取数据，分析并执行")
+
+    if not setup_exchange():
+        print("初始化失败，退出")
+        return
+
+    if TRADE_CONFIG['timeframe'] == '1h':
+        schedule.every().hour.at(":01").do(trading_bot)
+        print("调度: 每小时 :01 执行")
+    elif TRADE_CONFIG['timeframe'] == '15m':
+        schedule.every(15).minutes.do(trading_bot)
+        print("调度: 每15分钟执行")
+    else:
+        schedule.every().hour.at(":01").do(trading_bot)
+        print("调度: 默认每小时 :01 执行")
+
+    trading_bot()
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
+
