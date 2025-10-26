@@ -57,6 +57,15 @@ def parse_args():
     return parser.parse_args()
 
 
+def _to_float_or_none(val):
+    try:
+        if val is None:
+            return None
+        # handle strings like "12345.6"
+        return float(val)
+    except Exception:
+        return None
+
 def setup_exchange():
     try:
         # leverage (cross/isolated not forced here to avoid API mismatch)
@@ -486,6 +495,16 @@ def analyze_with_deepseek(price_data: dict) -> dict:
         if not all(k in signal_data for k in required):
             signal_data = create_fallback_signal(price_data)
 
+        # validate numeric sl/tp when not HOLD
+        if signal_data.get('signal') in ('BUY', 'SELL'):
+            sl_chk = _to_float_or_none(signal_data.get('stop_loss'))
+            tp_chk = _to_float_or_none(signal_data.get('take_profit'))
+            if sl_chk is None or tp_chk is None:
+                # degrade to HOLD to avoid runtime errors
+                fs = create_fallback_signal(price_data)
+                fs['reason'] = f"止损/止盈缺失或无效，退化为HOLD。原因: {signal_data.get('reason','')}"
+                signal_data = fs
+
         signal_data['timestamp'] = price_data['timestamp']
         signal_history.append(signal_data)
         if len(signal_history) > 30:
@@ -518,24 +537,31 @@ def execute_trade(signal_data: dict, price_data: dict):
                     print("近期已有同向换向尝试，避免频繁反手")
                     return
 
-    print(f"执行信号: {signal_data['signal']}")
-    print(f"置信度: {signal_data['confidence']}")
-    print(f"理由: {signal_data['reason']}")
-    print(f"止损: ${signal_data['stop_loss']:,.2f}")
-    print(f"止盈: ${signal_data['take_profit']:,.2f}")
+    print(f"执行信号: {signal_data.get('signal')}")
+    print(f"置信度: {signal_data.get('confidence')}")
+    print(f"理由: {signal_data.get('reason')}")
+    sl_val = _to_float_or_none(signal_data.get('stop_loss'))
+    tp_val = _to_float_or_none(signal_data.get('take_profit'))
+    print(f"止损: {'$' + format(sl_val, ',.2f') if sl_val is not None else 'N/A'}")
+    print(f"止盈: {'$' + format(tp_val, ',.2f') if tp_val is not None else 'N/A'}")
     print(f"当前持仓: {current_position}")
 
     # 计算并校验盈亏比（以当前价视作进场价）
     entry = float(price_data['price'])
-    sl = float(signal_data['stop_loss'])
-    tp = float(signal_data['take_profit'])
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
-    rrr = (reward / risk) if risk > 0 else 0
-    print(f"计算RRR: {rrr:.2f} (risk={risk:.2f}, reward={reward:.2f})")
+    sl = sl_val
+    tp = tp_val
+    if sl is not None and tp is not None:
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        rrr = (reward / risk) if risk > 0 else 0
+        print(f"计算RRR: {rrr:.2f} (risk={risk:.2f}, reward={reward:.2f})")
+    else:
+        risk = 0.0
+        rrr = 0.0
+        print("计算RRR: 无法计算（缺少止损/止盈）")
 
     # 若建议开仓但RRR < 3，则强制不交易
-    if signal_data['signal'] in ('BUY', 'SELL') and rrr < 3:
+    if signal_data.get('signal') in ('BUY', 'SELL') and rrr < 3:
         print("RRR低于3:1，放弃开仓")
         return
 

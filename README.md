@@ -33,8 +33,8 @@
 
 ### bash Anaconda3-2024.10-1-Linux-x86_64.sh
 
-### source /root/anaconda3/etc/profile.d/conda.sh 
-### echo ". /root/anaconda3/etc/profile.d/conda.sh" >> ~/.bashrc
+### source ~//anaconda3/etc/profile.d/conda.sh 
+### echo ". ~/anaconda3/etc/profile.d/conda.sh" >> ~/.bashrc
 
 
 
