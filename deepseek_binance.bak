@@ -34,11 +34,8 @@ TRADE_CONFIG = {
     'amount': 0.01,            # position size in BTC
     'leverage': 2,
     'timeframe': '15m',
-    'test_mode': True,
-    'data_points': 96,         # for indicators/trend
-    'risk_fraction': 0.02,     # max risk per trade (2% of equity)
-    'atr_multiplier': 1.5,     # ATR multiple for effective stop distance
-    'analysis_periods': {
+    'test_mode': False,
+        'risk_fraction': 0.02,     # max risk per trade (2% of equity)\n    'atr_multiplier': 1.5,     # ATR multiple for effective stop distance\n'analysis_periods': {
         'short_term': 20,
         'medium_term': 50,
         'long_term': 96,
@@ -549,25 +546,12 @@ def execute_trade(signal_data: dict, price_data: dict):
         return
 
     try:
-        # position sizing with ATR; risk <= equity * risk_fraction
+        # margin sanity check
         balance = exchange.fetch_balance()
-        usdt_balance = balance['USDT'].get('free', 0)
-        usdt_total = balance['USDT'].get('total', usdt_balance) if isinstance(balance['USDT'], dict) else usdt_balance
-        equity = usdt_total or usdt_balance
-        atr = float(price_data.get('technical_data', {}).get('atr', 0) or 0)
-        atr_mult = float(TRADE_CONFIG.get('atr_multiplier', 1.5))
-        effective_stop = max(risk, atr * atr_mult)
-        risk_cap = float(TRADE_CONFIG.get('risk_fraction', 0.02)) * float(equity)
-        trade_amount = risk_cap / effective_stop if effective_stop > 0 else 0
-        # cap by margin availability (80% of free)
-        entry_price = entry
-        max_amount_by_margin = (usdt_balance * 0.8) * max(TRADE_CONFIG['leverage'], 1) / max(entry_price, 1e-9)
-        trade_amount = max(0.0, min(trade_amount, max_amount_by_margin))
-        # round to 6 decimals (BTC step)
-        trade_amount = float(f"{trade_amount:.6f}")
-        print(f"ATR: {atr:.2f}, 有效止损: {effective_stop:.2f}, 风险上限: {risk_cap:.2f}USDT, 下单数量: {trade_amount} BTC")
-        if trade_amount <= 0:
-            print("计算后的下单数量为0，跳过下单")
+        usdt_balance = balance['USDT']['free']
+        required_margin = price_data['price'] * TRADE_CONFIG['amount'] / max(TRADE_CONFIG['leverage'], 1)
+        if required_margin > usdt_balance * 0.8:
+            print(f"保证金不足，需: {required_margin:.2f}USDT，可用: {usdt_balance:.2f}USDT")
             return
 
         symbol = TRADE_CONFIG['symbol']
@@ -578,7 +562,7 @@ def execute_trade(signal_data: dict, price_data: dict):
                 exchange.create_order(symbol, 'market', 'buy', current_position['size'], None, {'reduceOnly': True})
                 time.sleep(1)
                 print("开多...")
-                exchange.create_order(symbol, 'market', 'buy', trade_amount)
+                exchange.create_order(symbol, 'market', 'buy', TRADE_CONFIG['amount'])
                 # 查询新持仓并挂保护单
                 time.sleep(1)
                 new_pos = get_current_position()
@@ -588,7 +572,7 @@ def execute_trade(signal_data: dict, price_data: dict):
                 print("已在多头，跳过重复加仓")
             else:
                 print("开多...")
-                exchange.create_order(symbol, 'market', 'buy', trade_amount)
+                exchange.create_order(symbol, 'market', 'buy', TRADE_CONFIG['amount'])
                 time.sleep(1)
                 new_pos = get_current_position()
                 if new_pos:
@@ -600,7 +584,7 @@ def execute_trade(signal_data: dict, price_data: dict):
                 exchange.create_order(symbol, 'market', 'sell', current_position['size'], None, {'reduceOnly': True})
                 time.sleep(1)
                 print("开空...")
-                exchange.create_order(symbol, 'market', 'sell', trade_amount)
+                exchange.create_order(symbol, 'market', 'sell', TRADE_CONFIG['amount'])
                 time.sleep(1)
                 new_pos = get_current_position()
                 if new_pos:
@@ -609,7 +593,7 @@ def execute_trade(signal_data: dict, price_data: dict):
                 print("已在空头，跳过重复加仓")
             else:
                 print("开空...")
-                exchange.create_order(symbol, 'market', 'sell', trade_amount)
+                exchange.create_order(symbol, 'market', 'sell', TRADE_CONFIG['amount'])
                 time.sleep(1)
                 new_pos = get_current_position()
                 if new_pos:
