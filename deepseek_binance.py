@@ -19,6 +19,39 @@ deepseek_client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
+# 始终打印 DeepSeek 完整返回值（在 chat.completions.create 层做拦截日志）
+try:
+    _orig_ds_create = deepseek_client.chat.completions.create
+
+    def _ds_logging_create(*args, **kwargs):
+        resp = _orig_ds_create(*args, **kwargs)
+        try:
+            raw_dump = None
+            # OpenAI v1 风格对象可能提供 model_dump_json / to_dict / dict
+            if hasattr(resp, 'model_dump_json'):
+                raw_dump = resp.model_dump_json(indent=2, ensure_ascii=False)
+            elif hasattr(resp, 'to_dict'):
+                import json as _json
+                raw_dump = _json.dumps(resp.to_dict(), ensure_ascii=False, indent=2)
+            elif hasattr(resp, 'dict'):
+                import json as _json
+                raw_dump = _json.dumps(resp.dict(), ensure_ascii=False, indent=2)
+            if raw_dump:
+                print(f"DeepSeek原始响应: {raw_dump}")
+            else:
+                # 兜底：直接打印对象字符串
+                print(f"DeepSeek原始响应(对象): {resp}")
+        except Exception as _e:
+            try:
+                print(f"DeepSeek原始响应打印失败: {_e}; as str => {str(resp)}")
+            except Exception:
+                pass
+        return resp
+
+    deepseek_client.chat.completions.create = _ds_logging_create
+except Exception as _patch_e:
+    print(f"DeepSeek响应日志注入失败: {_patch_e}")
+
 # Binance USD-M Futures
 exchange = ccxt.binance({
     'options': {
@@ -509,7 +542,7 @@ def analyze_with_deepseek(price_data: dict) -> dict:
 }}
 
 请在返回JSON中包含支撑与阻力字段，示例如下：
-{
+{{
   "signal": "BUY|SELL|HOLD",
   "reason": "...",
   "stop_loss": 0,
@@ -517,7 +550,7 @@ def analyze_with_deepseek(price_data: dict) -> dict:
   "support": 0,
   "resistance": 0,
   "confidence": "HIGH|MEDIUM|LOW"
-}
+}}
 """
 
     try:
