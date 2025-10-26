@@ -30,9 +30,9 @@ exchange = ccxt.binance({
 
 # Trading config
 TRADE_CONFIG = {
-    'symbol': 'BTC/USDT',
+    'symbol': 'BNB/USDT',
     'amount': 0.01,            # position size in BTC
-    'leverage': 2,
+    'leverage': 5,
     'timeframe': '15m',
     'test_mode': False,
     'data_points': 96,         # for indicators/trend
