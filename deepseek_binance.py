@@ -68,6 +68,12 @@ def _to_float_or_none(val):
 
 def setup_exchange():
     try:
+        exchange.load_markets()
+        # 显式设置保证金模式：'isolated' 或 'cross'
+        # 也可以用环境变量 MARGIN_MODE 来切换
+        desired_mode = (os.getenv('MARGIN_MODE') or 'isolated').lower()  # 默认逐仓
+        exchange.set_margin_mode(desired_mode, TRADE_CONFIG['symbol'])
+        print(f"已设置保证金模式: {desired_mode}")
         # leverage (cross/isolated not forced here to avoid API mismatch)
         exchange.set_leverage(TRADE_CONFIG['leverage'], TRADE_CONFIG['symbol'])
         print(f"已设置杠杆: {TRADE_CONFIG['leverage']}x")
@@ -269,7 +275,6 @@ def get_btc_ohlcv_enhanced():
         previous = df.iloc[-2]
 
         trend_analysis = get_market_trend(df)
-        levels_analysis = get_support_resistance_levels(df)
 
         return {
             'price': current['close'],
@@ -295,7 +300,6 @@ def get_btc_ohlcv_enhanced():
                 'atr': current.get('atr', 0),
             },
             'trend_analysis': trend_analysis,
-            'levels_analysis': levels_analysis,
             'full_data': df,
         }
     except Exception as e:
@@ -308,7 +312,7 @@ def generate_technical_analysis_text(price_data: dict) -> str:
         return ""
     tech = price_data['technical_data']
     trend = price_data.get('trend_analysis', {})
-    levels = price_data.get('levels_analysis', {})
+    # 支撑/阻力由 DeepSeek 模型自行推导，不再从本地 levels_analysis 读取
 
     def safe_float(val, default=0.0):
         try:
@@ -335,6 +339,39 @@ def generate_technical_analysis_text(price_data: dict) -> str:
 支撑阻力:
 - 静态阻力: {safe_float(levels.get('static_resistance',0)):.2f}
 - 静态支撑: {safe_float(levels.get('static_support',0)):.2f}
+"""
+    return text
+
+
+def generate_technical_analysis_text_v2(price_data: dict) -> str:
+    if 'technical_data' not in price_data:
+        return ""
+    tech = price_data['technical_data']
+    trend = price_data.get('trend_analysis', {})
+
+    def safe_float(val, default=0.0):
+        try:
+            return float(val) if val is not None and pd.notna(val) else default
+        except Exception:
+            return default
+
+    text = f"""
+技术指标概览:
+- SMA5: {safe_float(tech['sma_5']):.2f} 偏离: {(price_data['price'] - safe_float(tech['sma_5']))/max(safe_float(tech['sma_5']),1e-9)*100:+.2f}%
+- SMA20: {safe_float(tech['sma_20']):.2f} 偏离: {(price_data['price'] - safe_float(tech['sma_20']))/max(safe_float(tech['sma_20']),1e-9)*100:+.2f}%
+- SMA50: {safe_float(tech['sma_50']):.2f} 偏离: {(price_data['price'] - safe_float(tech['sma_50']))/max(safe_float(tech['sma_50']),1e-9)*100:+.2f}%
+
+趋势判定:
+- 短期: {trend.get('short_term','N/A')}  中期: {trend.get('medium_term','N/A')}  总体: {trend.get('overall','N/A')}
+- MACD: {trend.get('macd','N/A')}
+
+动量/波动:
+- RSI: {safe_float(tech['rsi']):.2f}
+- MACD线: {safe_float(tech['macd']):.4f} 信号线: {safe_float(tech['macd_signal']):.4f}
+- 布林位置: {safe_float(tech['bb_position']):.2%}
+
+支撑/阻力:
+- 由模型根据最近K线与指标自行推导（此处不预设）
 """
     return text
 
@@ -410,7 +447,7 @@ def create_fallback_signal(price_data: dict) -> dict:
 
 
 def analyze_with_deepseek(price_data: dict) -> dict:
-    technical_analysis = generate_technical_analysis_text(price_data)
+    technical_analysis = generate_technical_analysis_text_v2(price_data)
 
     # recent K lines text (last 5)
     kline_text = f"最近5根{TRADE_CONFIG['timeframe']}K线:\n"
@@ -452,6 +489,11 @@ def analyze_with_deepseek(price_data: dict) -> dict:
 {sentiment_text}
 {signal_text}
 
+请你基于最近的K线与技术指标，自行识别关键支撑位与阻力位；
+并在返回的JSON中包含数值字段：support 与 resistance（单位USDT）。
+同时确保给出的止损/止盈与这些位置一致（做多：止损低于支撑、止盈接近阻力；做空相反），
+且满足 RRR ≥ 3（如不满足请给出 HOLD）。
+
 硬性要求：
 1) 结合“静态阻力/支撑”和当前价，给出合理的止损与止盈。
 2) 计算盈亏比 RRR = |take_profit - entry| / |entry - stop_loss|，若 RRR < 3 则必须给出 HOLD。
@@ -465,6 +507,17 @@ def analyze_with_deepseek(price_data: dict) -> dict:
   "take_profit": 数值价格,
   "confidence": "HIGH|MEDIUM|LOW"
 }}
+
+请在返回JSON中包含支撑与阻力字段，示例如下：
+{
+  "signal": "BUY|SELL|HOLD",
+  "reason": "...",
+  "stop_loss": 0,
+  "take_profit": 0,
+  "support": 0,
+  "resistance": 0,
+  "confidence": "HIGH|MEDIUM|LOW"
+}
 """
 
     try:
