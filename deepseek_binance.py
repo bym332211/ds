@@ -34,7 +34,7 @@ TRADE_CONFIG = {
     'amount': 0.01,            # position size in BTC
     'leverage': 2,
     'timeframe': '15m',
-    'test_mode': True,
+    'test_mode': False,
     'data_points': 96,         # for indicators/trend
     'risk_fraction': 0.02,     # max risk per trade (2% of equity)
     'atr_multiplier': 1.5,     # ATR multiple for effective stop distance
