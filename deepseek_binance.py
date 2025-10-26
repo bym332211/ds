@@ -71,11 +71,11 @@ def setup_exchange():
         exchange.load_markets()
         # 显式设置保证金模式：'isolated' 或 'cross'
         # 也可以用环境变量 MARGIN_MODE 来切换
-        desired_mode = (os.getenv('MARGIN_MODE') or 'isolated').lower()  # 默认逐仓
+        desired_mode = (os.getenv('MARGIN_MODE') or 'cross').lower()  # 默认逐仓
         exchange.set_margin_mode(desired_mode, TRADE_CONFIG['symbol'])
         print(f"已设置保证金模式: {desired_mode}")
         # leverage (cross/isolated not forced here to avoid API mismatch)
-        exchange.set_leverage(TRADE_CONFIG['leverage'], TRADE_CONFIG['symbol'])
+        exchange.set_leverage(TRADE_CONFIG['leverage'], TRADE_CONFIG['symbol'], {'marginMode': desired_mode})
         print(f"已设置杠杆: {TRADE_CONFIG['leverage']}x")
 
         balance = exchange.fetch_balance()
