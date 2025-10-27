@@ -63,6 +63,7 @@ def wait_fill_and_place_protection(exchange, side: str, order, sl_price: float, 
     order_id = order.get("id")
     deadline = time.time() + max_wait_sec
     filled_qty = 0.0
+    last_o = None
     while time.time() < deadline:
         try:
             o = exchange.fetch_order(order_id, symbol)
@@ -72,6 +73,7 @@ def wait_fill_and_place_protection(exchange, side: str, order, sl_price: float, 
             print(f"[LIMIT] status={status} filled={filled} remaining={remaining}")
             if status in ("closed","filled") or (filled > 0 and remaining <= 0):
                 filled_qty = filled
+                last_o = o
                 break
             time.sleep(poll_sec)
         except Exception as e:
@@ -92,7 +94,12 @@ def wait_fill_and_place_protection(exchange, side: str, order, sl_price: float, 
         sl = exchange.create_order(symbol, "STOP_MARKET", exit_side, filled_qty, None, {"stopPrice": sl_price, "reduceOnly": True})
         tp = exchange.create_order(symbol, "TAKE_PROFIT_MARKET", exit_side, filled_qty, None, {"stopPrice": tp_price, "reduceOnly": True})
         print(f"[LIMIT] Filled qty={filled_qty}. SL={sl.get('id')} TP={tp.get('id')}")
-        return {"ok": True, "entry": order, "sl": sl, "tp": tp}
+        avg = 0.0
+        try:
+            avg = float((last_o or {}).get("average") or 0.0)
+        except Exception:
+            pass
+        return {"ok": True, "entry": last_o or order, "sl": sl, "tp": tp, "filled_qty": filled_qty, "avg": avg}
     except Exception as e:
         print(f"Protective orders after limit fill failed: {e}")
         return {"ok": False, "error": str(e), "partial_filled_qty": filled_qty}

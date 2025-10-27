@@ -9,9 +9,11 @@ from dotenv import load_dotenv
 from bot.data import fetch_ohlcv_multi
 from bot.indicators import build_timeframe_features
 from bot.llm import DeepSeekClient, build_user_prompt
+from bot.telegram_notify import send_telegram_text
 from bot.exchange import init_exchange, fetch_position_info, fetch_equity
 from bot.risk import atr_position_size, compute_min_equity_required, market_info_rounders
 from bot.orders import compute_limit_price, place_market_with_protection, place_limit_postonly, wait_fill_and_place_protection
+from bot.protection_tracker import register_protection, poll_and_notify
 
 load_dotenv()
 
@@ -106,6 +108,13 @@ def tick(exchange: ccxt.binance, llm: DeepSeekClient):
     qty_suggested = float(decision.get("qty",0.0))
     reasons = decision.get("reasons", [])
 
+    # Only push to Telegram when decision is not HOLD
+    if action != "HOLD":
+        try:
+            send_telegram_text(f"[LLM Response @ {now_iso()}]\n{content}")
+        except Exception:
+            pass
+
     if action=="HOLD":
         log.info(f"HOLD: {reasons}")
         return
@@ -128,13 +137,50 @@ def tick(exchange: ccxt.binance, llm: DeepSeekClient):
     if qty <= 0:
         log.info("Computed qty <= 0 -> HOLD"); return
 
+    # Push concise final decision summary before execution
+    if action != "HOLD":
+        try:
+            send_telegram_text(
+                f"[Decision @ {now_iso()}]\n"
+                f"SYMBOL: {SYMBOL}\n"
+                f"ACTION: {action}\n"
+                f"SIDE: {side}\n"
+                f"QTY: {qty}\n"
+                f"SL: {sl_price}\n"
+                f"TP: {tp_price}"
+            )
+        except Exception:
+            pass
+
     entry_type = (entry_block.get("type") or "market").lower()
     if entry_type == "market":
         res = place_market_with_protection(exchange, side, qty, sl_price, tp_price)
         if res.get("ok"):
             log.info(f"{action} {side} via MARKET ok. qty={qty} SL={sl_price} TP={tp_price}")
+            # Push execution result
+            try:
+                entry = res.get("entry", {}) or {}
+                avg = entry.get("average") or entry.get("price")
+                eid = entry.get("id")
+                send_telegram_text(
+                    f"[Order Filled @ {now_iso()}]\n"
+                    f"TYPE: MARKET\nACTION: {action}\nSIDE: {side}\nQTY: {qty}\nAVG: {avg}\nSL: {sl_price}\nTP: {tp_price}\nENTRY_ID: {eid}"
+                )
+            except Exception:
+                pass
+            # Register protection orders for trigger monitoring
+            try:
+                register_protection(SYMBOL, side, res.get("sl"), res.get("tp"))
+            except Exception:
+                pass
         else:
             log.error(f"Market path failed: {res.get('error')}")
+            try:
+                send_telegram_text(
+                    f"[Order Failed @ {now_iso()}]\nTYPE: MARKET\nACTION: {action}\nSIDE: {side}\nREASON: {res.get('error')}"
+                )
+            except Exception:
+                pass
         return
 
     limit_price_raw = compute_limit_price(side, last_price, entry_block)
@@ -154,8 +200,31 @@ def tick(exchange: ccxt.binance, llm: DeepSeekClient):
     )
     if res.get("ok"):
         log.info(f"{action} {side} via LIMIT ok. SL={sl_price} TP={tp_price}")
+        try:
+            avg = res.get("avg")
+            fqty = res.get("filled_qty")
+            entry = res.get("entry", {}) or {}
+            eid = entry.get("id") if isinstance(entry, dict) else None
+            send_telegram_text(
+                f"[Order Filled @ {now_iso()}]\n"
+                f"TYPE: LIMIT\nACTION: {action}\nSIDE: {side}\nQTY: {fqty}\nAVG: {avg}\nSL: {sl_price}\nTP: {tp_price}\nENTRY_ID: {eid}"
+            )
+        except Exception:
+            pass
+        # Register protection orders for trigger monitoring
+        try:
+            register_protection(SYMBOL, side, res.get("sl"), res.get("tp"))
+        except Exception:
+            pass
     else:
         log.warning(f"LIMIT not filled or protection failed: {res.get('error')}")
+        try:
+            reason = res.get("error")
+            send_telegram_text(
+                f"[Order Not Filled @ {now_iso()}]\nTYPE: LIMIT\nACTION: {action}\nSIDE: {side}\nREASON: {reason}"
+            )
+        except Exception:
+            pass
 
 
 def main():
@@ -176,6 +245,11 @@ def main():
 
     while True:
         try:
+            # Check if any previously placed SL/TP has triggered
+            try:
+                poll_and_notify(exchange)
+            except Exception:
+                pass
             tick(exchange, llm)
         except Exception as e:
             log.exception(f"tick error: {e}")
